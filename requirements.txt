@@ -1,8 +1,6 @@
 streamlit
 PyMuPDF
-faiss-cpu
 sentence-transformers
-langchain
-langchain-community
-huggingface_hub
-
+faiss-cpu
+openai>=1.0.0
+langchain-text-splitters
