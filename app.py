@@ -1,18 +1,20 @@
 import fitz
 import re
 import os
-import shutil
 import uuid
+import shutil
 import streamlit as st
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.vectorstores import FAISS
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.llms import HuggingFaceHub
-from langchain.chains import RetrievalQA
-from langchain_core.documents import Document
-from langchain.prompts import PromptTemplate
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
+from openai import OpenAI
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# Phase 1: PDF Ingestion
+# Load embedding model with CPU mode for Streamlit Cloud
+EMBED_MODEL = SentenceTransformer("all-MiniLM-L6-v2", device='cpu')
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+
+# PDF Text Extraction
 def extract_text_from_pdf(pdf_path):
     doc = fitz.open(pdf_path)
     text = ""
@@ -20,69 +22,93 @@ def extract_text_from_pdf(pdf_path):
         text += page.get_text()
     return text
 
-# Phase 2: Clause Extraction
+# FAR/DFARS Clause Pattern Extraction
 def extract_clauses(text):
-    pattern = r"(\d{2}\.\d{3}-\d{1,2})[\s\S]{0,1000}"
+    pattern = r"(\d{2}\.\d{3}-\d{1,2})"
     matches = re.findall(pattern, text)
     return list(set(matches))
 
-# Phase 3: Vector Store Build
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+# Improved Chunking
+def chunk_text(text):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    return splitter.split_text(text)
 
-def build_vector_db(text, db_path="faiss_index"):
-    chunks = text_splitter.split_text(text)
-    documents = [Document(page_content=c) for c in chunks]
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    db = FAISS.from_documents(documents, embeddings)
-    db.save_local(db_path)
-    return db
+# Embedding & FAISS Indexing
+def embed_chunks(chunks):
+    vectors = EMBED_MODEL.encode(chunks)
+    index = faiss.IndexFlatL2(vectors.shape[1])
+    index.add(np.array(vectors))
+    return index, vectors, chunks
 
-# Phase 4: Explanation Prompt
-EXPLANATION_PROMPT = PromptTemplate(
-    input_variables=["clause"],
-    template="Explain the following FAR/DFARS clause in plain English for a new government contractor:\n\n{clause}\n\nExplanation:"
-)
+# Top-K Context Retrieval
+def query_index(index, vectors, chunks, user_query, top_k=6):
+    query_vec = EMBED_MODEL.encode([user_query])
+    D, I = index.search(np.array(query_vec), top_k)
+    results = [chunks[i] for i in I[0]]
+    return results
 
-def create_qa_chain(db_path="faiss_index"):
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    db = FAISS.load_local(db_path, embeddings)
-    retriever = db.as_retriever()
-    llm = HuggingFaceHub(
-        repo_id="mistralai/Mistral-7B-Instruct-v0.1",
-        model_kwargs={"temperature": 0.5, "max_new_tokens": 512}
+# LLM Call via OpenAI SDK (v1.x)
+def call_openai(prompt):
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "You are a senior federal contracting officer."},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=600,
+        temperature=0.3
     )
-    qa = RetrievalQA.from_chain_type(llm=llm, retriever=retriever, chain_type_kwargs={"prompt": EXPLANATION_PROMPT})
-    return qa
+    return response.choices[0].message.content
 
-# Phase 5: Streamlit UI
+# Streamlit UI
 def main():
     st.title("GovCon Contract Clause Assistant")
-    st.write("Upload a government contract and ask about FAR/DFARS clauses.")
 
-    uploaded_file = st.file_uploader("Upload PDF", type="pdf")
-    query = st.text_input("Ask a question about a clause:")
+    uploaded_file = st.file_uploader("Upload a government contract PDF", type="pdf")
 
     if uploaded_file is not None:
         session_id = str(uuid.uuid4())
-        temp_dir = f"temp_session_{session_id}"
+        temp_dir = f"temp_{session_id}"
         os.makedirs(temp_dir, exist_ok=True)
-        temp_pdf_path = os.path.join(temp_dir, "uploaded_contract.pdf")
+        path = os.path.join(temp_dir, "file.pdf")
 
-        with open(temp_pdf_path, "wb") as f:
+        with open(path, "wb") as f:
             f.write(uploaded_file.read())
 
-        text = extract_text_from_pdf(temp_pdf_path)
-        clauses = extract_clauses(text)
-        st.write("Detected Clauses:", clauses)
+        try:
+            text = extract_text_from_pdf(path)
+            if not text.strip():
+                st.error("Uploaded file is empty or unreadable.")
+                return
 
-        db = build_vector_db(text, db_path=os.path.join(temp_dir, "faiss_index"))
-        qa_chain = create_qa_chain(db_path=os.path.join(temp_dir, "faiss_index"))
+            st.subheader("Detected FAR/DFARS Clauses")
+            clauses = extract_clauses(text)
+            st.write(clauses)
 
-        if query:
-            answer = qa_chain.run(query)
-            st.write("**Answer:**", answer)
+            st.subheader("Ask a Question About the Contract")
+            user_query = st.text_input("Your question:")
 
-        shutil.rmtree(temp_dir, ignore_errors=True)
+            if user_query:
+                st.info("Processing document and generating response...")
+                chunks = chunk_text(text)
+                index, vectors, raw_chunks = embed_chunks(chunks)
+                context = query_index(index, vectors, raw_chunks, user_query, top_k=6)
+                prompt = (
+                    "You are a senior federal contracting officer explaining complex FAR/DFARS clauses.\n"
+                    "Be concise, legally accurate, and helpful to non-lawyers.\n\n"
+                    "Extracted contract context:\n"
+                    f"{chr(10).join(context)}\n\n"
+                    "User question:\n"
+                    f"{user_query}\n\n"
+                    "Answer:"
+                )
+                answer = call_openai(prompt)
+                st.success(answer)
+
+        except Exception as e:
+            st.error(f"Error: {e}")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 if __name__ == "__main__":
     main()
